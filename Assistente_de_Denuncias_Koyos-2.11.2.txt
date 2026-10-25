@@ -1,0 +1,2214 @@
+// ==UserScript==
+// @name         Assistente de Denúncias Koyo's
+// @namespace    grepolis-support-helper
+// @version      2.11.2
+// @description  Adiciona captura de denúncias pelo Grepolis e GrepoData, mantendo o fluxo normal do suporte.
+// @match        https://support.innogames.com/playerticket/new*
+// @match        https://support.innogames.com/t*
+// @match        https://*.grepolis.com/game*
+// @match        https://grepodata.com/player*
+// @match        https://grepodata.com/alliance*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const CHAVE_JOGADORES = 'gp_multicontas_registros_v2';
+    const CHAVE_JOGADORES_ANTIGA = 'gp_multicontas_jogadores_v1';
+    const CHAVE_SELECAO = 'gp_multicontas_selecao_v1';
+    const CHAVE_MODO_SELECAO = 'gp_multicontas_modo_selecao_v1';
+    const CHAVE_ACAO_PENDENTE = 'gp_multicontas_acao_pendente_v1';
+    const CHAVE_ULTIMA_CAPTURA = 'gp_multicontas_ultima_captura_v1';
+
+    // Organização dos jogadores: grupo de origem + estado do relatório.
+    // O grupo identifica a origem/contexto; o estado identifica se o jogador
+    // já passou por um lote confirmado no suporte.
+    const GRUPO_LEGADO = {
+        tipo: 'legado',
+        nome: 'Sem aliança / denúncia única'
+    };
+    const GRUPO_PERFIL = {
+        tipo: 'perfil',
+        nome: 'Adicionados por perfil'
+    };
+
+    // Armazenamento compartilhado entre o jogo e a página de suporte.
+    function normalizarTexto(nome) {
+        return String(nome || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function criarGrupo(tipo = 'legado', nome = GRUPO_LEGADO.nome) {
+        return {
+            tipo: tipo || 'legado',
+            nome: normalizarTexto(nome) || GRUPO_LEGADO.nome
+        };
+    }
+
+    function normalizarRegistro(item) {
+        if (typeof item === 'string') {
+            const nome = normalizarTexto(item);
+            return nome
+                ? {
+                    nome,
+                    tipo: 'jogador',
+                    grupo: { ...GRUPO_LEGADO },
+                    estado: 'pendente',
+                    reportes: 0
+                }
+                : null;
+        }
+
+        if (!item || typeof item !== 'object') return null;
+
+        const nome = normalizarTexto(item.nome);
+        if (!nome) return null;
+
+        const grupo = item.grupo && typeof item.grupo === 'object'
+            ? criarGrupo(item.grupo.tipo, item.grupo.nome)
+            : item.pasta && typeof item.pasta === 'object'
+                ? criarGrupo(item.pasta.tipo, item.pasta.nome)
+                : item.origem && typeof item.origem === 'object'
+                    ? criarGrupo(item.origem.tipo, item.origem.nome)
+                    : { ...GRUPO_LEGADO };
+
+        const estado = item.estado === 'reportado'
+            ? 'reportado'
+            : 'pendente';
+
+        return {
+            nome,
+            tipo: item.tipo === 'alianca' ? 'alianca' : 'jogador',
+            grupo,
+            estado,
+            reportes: Number.isFinite(Number(item.reportes))
+                ? Math.max(0, Math.floor(Number(item.reportes)))
+                : 0
+        };
+    }
+
+    function lerJogadoresGuardados() {
+        try {
+            let valor = GM_getValue(CHAVE_JOGADORES, null);
+            const migrando = !Array.isArray(valor);
+            if (migrando) valor = GM_getValue(CHAVE_JOGADORES_ANTIGA, []);
+            if (!Array.isArray(valor)) return [];
+
+            const registros = valor.map(normalizarRegistro).filter(Boolean);
+
+            // Também normaliza registros antigos que já estavam na chave v2.
+            const mudouFormato = registros.some((registro, indice) => {
+                const original = valor[indice];
+                return typeof original === 'string' ||
+                    !original ||
+                    original.grupo?.nome !== registro.grupo.nome ||
+                    original.grupo?.tipo !== registro.grupo.tipo ||
+                    (original.estado !== 'reportado' && original.estado !== 'pendente') ||
+                    !Number.isFinite(Number(original.reportes)) || Number(original.reportes) < 0;
+            });
+
+            if (migrando || mudouFormato) {
+                GM_setValue(CHAVE_JOGADORES, registros);
+            }
+
+            return registros;
+        } catch (erro) {
+            console.error('[Grepolis] Erro ao ler a lista de jogadores:', erro);
+            return [];
+        }
+    }
+
+    function salvarJogadoresGuardados(registros) {
+        GM_setValue(CHAVE_JOGADORES, registros);
+    }
+
+    // Ao abrir um ticket existente (/t + número), sincroniza os jogadores
+    // exibidos pelo próprio suporte com a lista local do assistente.
+    function sincronizarJogadoresDoTicket() {
+        if (!/^\/t\d+\/?$/.test(window.location.pathname)) return false;
+
+        const paragrafo = [...document.querySelectorAll('p.text-primary')]
+            .find(elemento => /Jogadores denunciados\s*:/i.test(elemento.textContent || ''));
+        if (!paragrafo) return true;
+
+        const texto = paragrafo.textContent || '';
+        const correspondencia = texto.match(/Jogadores denunciados\s*:\s*(.*)/i);
+        if (!correspondencia) return true;
+
+        const nomes = [...new Set(correspondencia[1]
+            .split(/[,;\n]+/)
+            .map(nome => normalizarTexto(nome))
+            .filter(Boolean))];
+        if (!nomes.length) return true;
+
+        const registros = lerJogadoresGuardados();
+        const porNome = new Map(registros.map(registro => [
+            registro.nome.toLocaleLowerCase(), registro
+        ]));
+
+        for (const nome of nomes) {
+            const chave = nome.toLocaleLowerCase();
+            const existente = porNome.get(chave);
+            if (existente) {
+                existente.estado = 'reportado';
+            } else {
+                const novo = {
+                    nome,
+                    tipo: 'jogador',
+                    grupo: { ...GRUPO_LEGADO },
+                    estado: 'reportado'
+                };
+                registros.push(novo);
+                porNome.set(chave, novo);
+            }
+        }
+
+        salvarJogadoresGuardados(registros);
+        console.info(`[Grepolis] Ticket ${window.location.pathname} sincronizado: ${nomes.length} jogador(es) marcado(s) como reportado(s).`);
+        return true;
+    }
+
+    // A página de ticket não precisa carregar o painel do assistente; basta
+    // sincronizar os nomes e encerrar a execução nesta rota.
+    if (sincronizarJogadoresDoTicket()) return;
+
+    function chaveJogador(nome) {
+        return normalizarNome(nome).toLocaleLowerCase();
+    }
+
+    function adicionarNomes(nomes, grupo = GRUPO_LEGADO) {
+        const registros = lerJogadoresGuardados();
+        const porNome = new Map(
+            registros.map(registro => [chaveJogador(registro.nome), registro])
+        );
+        const novosRegistros = [];
+        let adicionados = 0;
+
+        const grupoAtual = criarGrupo(grupo.tipo, grupo.nome);
+
+        for (const bruto of nomes) {
+            const nome = normalizarTexto(bruto);
+            if (!nome) continue;
+
+            const chave = chaveJogador(nome);
+            const existente = porNome.get(chave);
+
+            if (existente) {
+                // Capturar pela aliança associa o jogador à pasta dessa aliança,
+                // mesmo que ele já estivesse cadastrado por outra fonte. A
+                // identidade continua única e não criamos uma segunda entrada.
+                // Capturas individuais só retiram o jogador do grupo legado.
+                if (
+                    (grupoAtual.tipo === 'alianca' &&
+                        (existente.grupo?.tipo !== grupoAtual.tipo ||
+                         chaveJogador(existente.grupo?.nome) !== chaveJogador(grupoAtual.nome))) ||
+                    (existente.grupo?.tipo === GRUPO_LEGADO.tipo &&
+                        grupoAtual.tipo !== GRUPO_LEGADO.tipo)
+                ) {
+                    existente.grupo = { ...grupoAtual };
+                }
+                continue;
+            }
+
+            const registro = {
+                nome,
+                tipo: 'jogador',
+                grupo: { ...grupoAtual },
+                estado: 'pendente'
+            };
+
+            porNome.set(chave, registro);
+            novosRegistros.push(registro);
+            adicionados++;
+        }
+
+        const capturaAtual = [...new Map(
+            nomes.map(nome => [chaveJogador(nome), normalizarTexto(nome)])
+        ).values()].filter(Boolean);
+
+        GM_setValue(CHAVE_ULTIMA_CAPTURA, capturaAtual);
+        salvarJogadoresGuardados([...novosRegistros, ...registros]);
+
+        return {
+            total: registros.length + adicionados,
+            adicionados,
+            registros: lerJogadoresGuardados()
+        };
+    }
+
+    // Incrementa apenas quando o fluxo do formulário confirma uma nova inclusão.
+    // Abrir tickets antigos ou apenas marcar o estado como reportado não altera a contagem.
+    function incrementarContagemReportes(nome) {
+        const chave = chaveJogador(nome);
+        const registros = lerJogadoresGuardados();
+        const registro = registros.find(item => chaveJogador(item.nome) === chave);
+
+        if (!registro) {
+            console.warn(`[Grepolis] Não foi possível contar o reporte: jogador não cadastrado (${nome}).`);
+            return false;
+        }
+
+        registro.reportes = Math.max(0, Math.floor(Number(registro.reportes) || 0)) + 1;
+        salvarJogadoresGuardados(registros);
+        return true;
+    }
+
+    function marcarJogadoresComoReportados(nomes) {
+        const chaves = new Set(nomes.map(chaveJogador));
+        const registros = lerJogadoresGuardados();
+
+        let alterados = 0;
+
+        for (const registro of registros) {
+            if (chaves.has(chaveJogador(registro.nome)) &&
+                registro.estado !== 'reportado') {
+                registro.estado = 'reportado';
+                alterados++;
+            }
+        }
+
+        if (alterados) salvarJogadoresGuardados(registros);
+        return alterados;
+    }
+
+    function iniciarColetorNoJogo() {
+        // O assistente não fica mais fixo na tela: o botão é criado
+        // somente dentro de um perfil individual ou de aliança aberto.
+        const ID_BOTAO = 'gp-denunciar-perfil-koyos';
+
+        function encontrarPerfilJogador() {
+            const cabecalhos = [...document.querySelectorAll('#player_info.bold h3')]
+                .filter(el => el.getClientRects().length && getComputedStyle(el).display !== 'none');
+
+            for (const cabecalho of cabecalhos.reverse()) {
+                const info = cabecalho.closest('#player_info.bold');
+                if (!info) continue;
+                const raiz = info.closest('.ui-dialog, .gpwindow') || info;
+                if (raiz.querySelector('.members_list')) continue;
+                const nome = normalizarTexto(cabecalho.textContent);
+                if (nome) return { tipo: 'jogador', nome, raiz: info };
+            }
+            return null;
+        }
+
+        function encontrarPerfilAlianca() {
+            const cabecalhos = [...document.querySelectorAll('#player_info h3.bold')]
+                .filter(el => el.getClientRects().length && getComputedStyle(el).display !== 'none');
+
+            for (const cabecalho of cabecalhos.reverse()) {
+                const info = cabecalho.closest('#player_info');
+                if (!info || info.classList.contains('bold')) continue;
+                const nome = normalizarTexto(cabecalho.textContent);
+                if (nome) return { tipo: 'alianca', nome, raiz: info };
+            }
+            return null;
+        }
+
+        function membrosDaAlianca(raiz) {
+            // Tenta primeiro a lista dentro do perfil aberto e depois a janela
+            // visível que contém a lista de membros da aliança.
+            const janela = raiz.closest('.ui-dialog, .gpwindow') || raiz;
+            let links = [...janela.querySelectorAll('.members_list a.gp_player_link')];
+
+            if (!links.length) {
+                const janelas = [...document.querySelectorAll('.ui-dialog, .gpwindow')]
+                    .filter(el => el.getClientRects().length && getComputedStyle(el).display !== 'none');
+                for (const outra of janelas) {
+                    links = [...outra.querySelectorAll('.members_list a.gp_player_link')];
+                    if (links.length) break;
+                }
+            }
+
+            const nomes = links
+                .map(link => normalizarTexto(link.getAttribute('title') || link.textContent))
+                .filter(Boolean);
+            return [...new Map(nomes.map(nome => [nome.toLocaleLowerCase(), nome])).values()];
+        }
+
+        function abrirSuporteComCaptura(perfil) {
+            let nomes = [];
+            if (perfil.tipo === 'jogador') {
+                nomes = [perfil.nome];
+            } else {
+                nomes = membrosDaAlianca(perfil.raiz);
+                // Se o perfil de aliança não tiver a lista de membros carregada,
+                // não abrir o formulário como se a captura tivesse sido concluída.
+                if (!nomes.length) {
+                    alert('Não encontrei a lista de membros desta aliança. Abra a aba/lista de membros, aguarde carregar e tente novamente.');
+                    return;
+                }
+            }
+
+            adicionarNomes(nomes, perfil.tipo === 'alianca'
+                ? { tipo: 'alianca', nome: perfil.nome }
+                : GRUPO_PERFIL);
+            // Encaminha a intenção para o suporte: selecionar este jogador ou
+            // os cinco primeiros membros disponíveis da aliança capturada.
+            GM_setValue(CHAVE_ACAO_PENDENTE, {
+                tipo: perfil.tipo,
+                nomes: perfil.tipo === 'jogador' ? [perfil.nome] : nomes,
+                grupo: perfil.tipo === 'alianca'
+                    ? { tipo: 'alianca', nome: perfil.nome }
+                    : (identificarAliancaDoPerfil()
+                        ? { tipo: 'alianca', nome: identificarAliancaDoPerfil() }
+                        : GRUPO_PERFIL),
+                criadoEm: Date.now()
+            });
+            GM_setValue(CHAVE_SELECAO, []);
+            // A lista compartilhada e a ação ficam gravadas antes de abrir o suporte.
+            window.open('https://support.innogames.com/playerticket/new', '_blank', 'noopener');
+        }
+
+        function atualizarBotaoPerfil() {
+            const perfilJogador = encontrarPerfilJogador();
+            const perfilAlianca = perfilJogador ? null : encontrarPerfilAlianca();
+            const perfil = perfilJogador || perfilAlianca;
+            const botaoExistente = document.getElementById(ID_BOTAO);
+
+            if (!perfil) {
+                if (botaoExistente) botaoExistente.remove();
+                return;
+            }
+
+            if (botaoExistente && botaoExistente.dataset.tipo === perfil.tipo &&
+                botaoExistente.dataset.nome === perfil.nome) return;
+            if (botaoExistente) botaoExistente.remove();
+
+            const botao = document.createElement('button');
+            botao.id = ID_BOTAO;
+            botao.type = 'button';
+            botao.dataset.tipo = perfil.tipo;
+            botao.dataset.nome = perfil.nome;
+            botao.textContent = perfil.tipo === 'jogador' ? 'Denunciar' : 'Denunciar aliança';
+            botao.title = perfil.tipo === 'jogador'
+                ? 'Abrir o assistente de denúncia e capturar este jogador'
+                : 'Abrir o assistente de denúncia e capturar os membros desta aliança';
+            // Reaproveita a estrutura visual nativa dos botões do Grepolis.
+            botao.className = 'button_new center gp-denunciar-button' +
+                (perfil.tipo === 'jogador' ? ' gp-denunciar-jogador-button' : '');
+            botao.style.cssText = perfil.tipo === 'jogador'
+                ? 'display:block;clear:both;width:max-content;margin:3px 0 4px;cursor:pointer;transform:scale(0.8);transform-origin:left top;'
+                : 'display:inline-block;margin:4px 0;cursor:pointer;';
+            botao.innerHTML = '<div class="left"></div><div class="right"></div>' +
+                '<div class="caption js-caption"><span>' + botao.textContent +
+                '</span><div class="effect js-effect"></div></div>';
+
+            botao.addEventListener('click', () => {
+                // Revalidar o perfil no clique para não capturar um nome antigo
+                // se a janela tiver mudado entre a renderização e a ação.
+                const atual = perfil.tipo === 'jogador' ? encontrarPerfilJogador() : encontrarPerfilAlianca();
+                if (!atual) {
+                    alert('O perfil não está mais aberto. Abra-o novamente e tente outra vez.');
+                    atualizarBotaoPerfil();
+                    return;
+                }
+                abrirSuporteComCaptura(atual);
+            });
+
+            // Na aliança, coloca o botão na área nativa de ações (#ally_buttons),
+            // ao lado de "Candidatar-se". Para jogadores, usa um botão curto
+            // abaixo da linha do cabeçalho e dos ícones do Dio/GRCRT.
+            if (perfil.tipo === 'alianca') {
+                const areaBotoes = document.querySelector('#ally_buttons .center_box');
+                if (areaBotoes) {
+                    // Mantém os dois botões na mesma linha e coloca Denunciar
+                    // aliança à direita, deslocando Candidatar-se para a esquerda.
+                    areaBotoes.style.display = 'flex';
+                    areaBotoes.style.flexDirection = 'row';
+                    areaBotoes.style.justifyContent = 'center';
+                    areaBotoes.style.alignItems = 'center';
+                    areaBotoes.style.flexWrap = 'nowrap';
+                    areaBotoes.style.gap = '6px';
+
+                    const candidatar = areaBotoes.querySelector('.btn_apply_to_alliance');
+                    if (candidatar) {
+                        // Neutraliza o posicionamento/alinhamento herdado do botão nativo,
+                        // para que ele ocupe o espaço à esquerda sem empurrar o novo botão.
+                        candidatar.style.position = 'relative';
+                        candidatar.style.left = 'auto';
+                        candidatar.style.right = 'auto';
+                        candidatar.style.float = 'none';
+                        candidatar.style.flex = '0 0 auto';
+                        candidatar.style.margin = '4px 0';
+                        botao.style.position = 'relative';
+                        botao.style.left = 'auto';
+                        botao.style.right = 'auto';
+                        botao.style.float = 'none';
+                        botao.style.flex = '0 0 auto';
+                        areaBotoes.insertBefore(candidatar, areaBotoes.firstChild);
+                        areaBotoes.insertBefore(botao, candidatar.nextSibling);
+                    } else {
+                        areaBotoes.appendChild(botao);
+                    }
+                } else {
+                    perfil.raiz.appendChild(botao);
+                }
+            } else {
+                // Para jogador, coloca o botão compacto na faixa azul do título
+                // do perfil, ao lado de "Perfil", sem ocupar espaço no conteúdo.
+                const janelaPerfil = perfil.raiz.closest('.ui-dialog, .gpwindow') || perfil.raiz.parentElement;
+                // O diálogo pode conter outras faixas azuis (por exemplo, a seção de cidades).
+                // Prioriza explicitamente o cabeçalho do bloco #profile_info mostrado no perfil.
+                const cabecalhoPerfil =
+                    janelaPerfil?.querySelector('#profile_info > .game_border > .game_header.bold') ||
+                    janelaPerfil?.querySelector('#profile_info .game_header.bold') ||
+                    perfil.raiz.closest('#profile_info')?.querySelector('.game_header.bold') ||
+                    perfil.raiz.querySelector('.game_header.bold');
+                if (cabecalhoPerfil) {
+                    cabecalhoPerfil.style.display = 'flex';
+                    cabecalhoPerfil.style.alignItems = 'center';
+                    cabecalhoPerfil.style.justifyContent = 'space-between';
+                    cabecalhoPerfil.style.gap = '8px';
+                    botao.style.cssText = 'display:inline-block;flex:0 0 auto;white-space:nowrap;margin:0 4px 0 auto;cursor:pointer;transform:scale(0.968);transform-origin:right center;';
+                    cabecalhoPerfil.appendChild(botao);
+                } else {
+                    // Fallback caso uma variante da interface não tenha o cabeçalho esperado.
+                    const grepolisScore = perfil.raiz.querySelector('#player_points .grepolis_score_container');
+                    if (grepolisScore) {
+                        grepolisScore.insertAdjacentElement('afterend', botao);
+                    } else {
+                        perfil.raiz.appendChild(botao);
+                    }
+                }
+            }
+        }
+
+        const observador = new MutationObserver(() => atualizarBotaoPerfil());
+        observador.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+        atualizarBotaoPerfil();
+    }
+
+
+    // -------------------------------------------------------------------------
+    // GrepoData
+    // -------------------------------------------------------------------------
+    // O GrepoData é apenas uma nova fonte de captura. Os nomes entram nas
+    // mesmas chaves e no mesmo fluxo já usado pelo sistema Koyo.
+    function iniciarIntegracaoGrepoData() {
+        const ID_BOTAO_PLAYER = 'gp-grepodata-denunciar-player-koyos';
+        const ID_BOTAO_ALLIANCE = 'gp-grepodata-denunciar-alliance-koyos';
+
+        const FLAG_SVG = `
+            <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+                style="width:14px;height:14px;flex:none"
+            >
+                <path d="M5.25 21V4.5"></path>
+                <path d="M5.25 4.5c2.4-1.6 4.8-1.6 7.2 0s4.8 1.6 7.2 0v8.25c-2.4 1.6-4.8 1.6-7.2 0s-4.8-1.6-7.2 0"></path>
+            </svg>
+        `;
+
+        function criarBotao(texto, id, title) {
+            const botao = document.createElement('button');
+            botao.id = id;
+            botao.type = 'button';
+            botao.title = title;
+            botao.className =
+                'inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border-0 bg-white px-2 py-1 text-xs font-semibold tracking-normal text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-700';
+            botao.innerHTML = `${FLAG_SVG}<span>${texto}</span>`;
+            return botao;
+        }
+
+        function aguardarElemento(seletor, limite = 5000) {
+            return new Promise(resolve => {
+                const inicio = Date.now();
+
+                const verificar = () => {
+                    const elemento = document.querySelector(seletor);
+                    if (elemento) {
+                        resolve(elemento);
+                        return;
+                    }
+
+                    if (Date.now() - inicio >= limite) {
+                        resolve(null);
+                        return;
+                    }
+
+                    setTimeout(verificar, 100);
+                };
+
+                verificar();
+            });
+        }
+
+        function fecharMailList() {
+            const dialog = document.querySelector('maillist-dialog');
+            if (!dialog) return;
+
+            const fechar = [...dialog.querySelectorAll('button')]
+                .find(botao => /^(close|fechar)$/i.test(botao.textContent.trim()));
+
+            if (fechar) fechar.click();
+        }
+
+        async function capturarMailList() {
+            const botaoMailList = [...document.querySelectorAll(
+                'button[title="Get a list of player names"]'
+            )].find(botao => botao.getClientRects().length);
+
+            if (!botaoMailList) {
+                throw new Error('Botão "Mail list" não encontrado.');
+            }
+
+            let pre = document.querySelector('#bb_code');
+
+            if (!pre) {
+                botaoMailList.click();
+                pre = await aguardarElemento('#bb_code');
+            }
+
+            if (!pre) {
+                throw new Error('A lista de nomes do Mail list não foi carregada.');
+            }
+
+            const nomes = [...new Set(
+                (pre.textContent || '')
+                    .split(';')
+                    .map(nome => normalizarTexto(nome))
+                    .filter(Boolean)
+            )];
+
+            if (!nomes.length) {
+                throw new Error('O Mail list abriu, mas não contém nomes de jogadores.');
+            }
+
+            return nomes;
+        }
+
+        function salvarCapturaEPrepararSuporte(nomes, nomeAlianca) {
+            adicionarNomes(nomes, {
+                tipo: 'alianca',
+                nome: nomeAlianca
+            });
+
+            GM_setValue(CHAVE_ACAO_PENDENTE, {
+                tipo: 'alianca',
+                nomes,
+                grupo: { tipo: 'alianca', nome: nomeAlianca },
+                criadoEm: Date.now()
+            });
+
+            GM_setValue(CHAVE_SELECAO, []);
+
+            window.open(
+                'https://support.innogames.com/playerticket/new',
+                '_blank',
+                'noopener'
+            );
+        }
+
+        async function denunciarAlianca() {
+            const botao = document.getElementById(ID_BOTAO_ALLIANCE);
+            if (!botao || botao.disabled) return;
+
+            botao.disabled = true;
+            const textoOriginal = botao.innerHTML;
+            botao.innerHTML = `${FLAG_SVG}<span>Capturando...</span>`;
+
+            try {
+                const nomes = await capturarMailList();
+                const nomeAlianca = normalizarTexto(
+                    document.querySelector('h1')?.textContent
+                ) || 'Aliança sem nome';
+                salvarCapturaEPrepararSuporte(nomes, nomeAlianca);
+            } catch (erro) {
+                console.error('[Koyo] Falha ao capturar aliança do GrepoData:', erro);
+                alert(`Não foi possível capturar os jogadores desta aliança.\n\n${erro.message}`);
+            } finally {
+                fecharMailList();
+                botao.disabled = false;
+                botao.innerHTML = textoOriginal;
+            }
+        }
+
+        function inserirBotaoAlianca() {
+            if (!/\/alliance(?:\/|$)/.test(location.pathname)) return;
+
+            const mailList = [...document.querySelectorAll(
+                'button[title="Get a list of player names"]'
+            )].find(botao => botao.getClientRects().length);
+
+            if (!mailList || document.getElementById(ID_BOTAO_ALLIANCE)) return;
+
+            const botao = criarBotao(
+                'Denunciar',
+                ID_BOTAO_ALLIANCE,
+                'Denunciar jogadores desta aliança'
+            );
+
+            botao.addEventListener('click', denunciarAlianca);
+            mailList.insertAdjacentElement('afterend', botao);
+        }
+
+        function identificarAliancaDoPerfil() {
+            // No perfil do GrepoData, a aliança costuma aparecer como um link
+            // para a própria página da aliança. Procuramos links reais de
+            // aliança e usamos o texto visível como nome da pasta.
+            const links = [...document.querySelectorAll('a[href]')]
+                .filter(link => {
+                    const href = link.getAttribute('href') || '';
+                    let caminho = href;
+
+                    try {
+                        caminho = new URL(href, location.origin).pathname;
+                    } catch (_) {
+                        // Mantém o href original para a verificação abaixo.
+                    }
+
+                    return /\/alliance(?:\/|$)/i.test(caminho) &&
+                        link.getClientRects().length > 0;
+                });
+
+            for (const link of links) {
+                const nome = normalizarTexto(link.textContent);
+                if (!nome) continue;
+                if (/^(alliance|aliança|alliances|alianças)$/i.test(nome)) continue;
+                return nome;
+            }
+
+            return '';
+        }
+
+        function inserirBotaoPlayer() {
+            if (!/\/player(?:\/|$)/.test(location.pathname)) return;
+
+            const titulo = document.querySelector('#player-name');
+            if (!titulo || !titulo.getClientRects().length) return;
+            if (document.getElementById(ID_BOTAO_PLAYER)) return;
+
+            const nome = normalizarTexto(titulo.textContent);
+            if (!nome) return;
+
+            const linha = titulo.parentElement;
+            if (!linha) return;
+
+            const botao = criarBotao(
+                'Denunciar',
+                ID_BOTAO_PLAYER,
+                `Denunciar ${nome}`
+            );
+
+            // No perfil, usa o mesmo porte dos botões "Other worlds" e "Compare"
+            // do próprio GrepoData.
+            botao.className =
+                'inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md border-0 bg-white px-3 py-2 text-sm font-semibold text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-700';
+
+            botao.querySelector('svg').setAttribute('width', '18');
+            botao.querySelector('svg').setAttribute('height', '18');
+            botao.querySelector('svg').style.width = '18px';
+            botao.querySelector('svg').style.height = '18px';
+
+            botao.addEventListener('click', () => {
+                const nomeAtual = normalizarTexto(
+                    document.querySelector('#player-name')?.textContent
+                );
+
+                if (!nomeAtual) {
+                    alert('Não foi possível identificar o jogador atual.');
+                    return;
+                }
+
+                const nomeAlianca = identificarAliancaDoPerfil();
+                const grupoCaptura = nomeAlianca
+                    ? { tipo: 'alianca', nome: nomeAlianca }
+                    : GRUPO_PERFIL;
+
+                adicionarNomes([nomeAtual], grupoCaptura);
+
+                GM_setValue(CHAVE_ACAO_PENDENTE, {
+                    // Continua sendo uma denúncia individual: apenas a
+                    // organização da pasta muda quando a aliança é encontrada.
+                    tipo: 'jogador',
+                    nomes: [nomeAtual],
+                    grupo: grupoCaptura,
+                    criadoEm: Date.now()
+                });
+
+                GM_setValue(CHAVE_SELECAO, []);
+
+                window.open(
+                    'https://support.innogames.com/playerticket/new',
+                    '_blank',
+                    'noopener'
+                );
+            });
+
+            if (getComputedStyle(linha).display !== 'flex') {
+                linha.style.display = 'flex';
+            }
+
+            linha.style.alignItems = 'center';
+            linha.style.gap = '8px';
+
+            botao.style.marginLeft = 'auto';
+            botao.style.flex = '0 0 auto';
+
+            linha.appendChild(botao);
+
+            titulo.style.minWidth = '0';
+            titulo.style.flex = '1 1 auto';
+        }
+
+        function atualizar() {
+            inserirBotaoAlianca();
+            inserirBotaoPlayer();
+        }
+
+        const observador = new MutationObserver(atualizar);
+        observador.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        atualizar();
+    }
+
+    if (location.hostname === 'grepodata.com' &&
+        (/\/player(?:\/|$)/.test(location.pathname) ||
+         /\/alliance(?:\/|$)/.test(location.pathname))) {
+        iniciarIntegracaoGrepoData();
+        return;
+    }
+
+    // No jogo, inicia apenas o coletor e não executa o código do formulário.
+    if (/\.grepolis\.com$/.test(location.hostname) && /\/game/.test(location.pathname)) {
+        iniciarColetorNoJogo();
+        return;
+    }
+
+    const TITULO_MULTICONTAS =
+        'Suspeita de multicontas utilizando VPN ou proxie.';
+
+    const MENSAGEM_BASE_MULTICONTAS =
+        'Gostaria de solicitar a análise das contas selecionadas. ' +
+        'Todas essas contas são suspeitas de serem multicontas utilizando VPN.\n' +
+        'e apresentam várias atividades suspeitas.';
+
+    const SUBCATEGORIAS = {
+        colonizadores: {
+            titulo: 'Produção de colonizadores para venda e geração de pontos de combate',
+
+            mensagem:
+                'Estas contas aparentam produzir navios colonizadores ' +
+                'com a finalidade de gerar pontos de combate para possível ' +
+                'venda ou negociação externa ao jogo. Solicito a verificação ' +
+                'dessa atividade.',
+
+            dica:
+                'Dica: espione as cidades ou reúna uma captura de tela ' +
+                'mostrando uma grande quantidade de navios colonizadores ' +
+                'em uma cidade que você tenha atacado ou que tenha sido ' +
+                'atacada por outro jogador.'
+        },
+
+        defesa: {
+            titulo: 'Produção de defesa como serviço',
+
+            mensagem:
+                'Estas contas apresentam padrões semelhantes de produção ' +
+                'de tropas defensivas. Há suspeita de automação do ' +
+                'recrutamento por scripts, possivelmente utilizando ' +
+                'configurações ou presets semelhantes. Solicito a análise ' +
+                'dos padrões de atividade e recrutamento.',
+
+            dica:
+                'Dica: procure capturas de tela de relatórios de cidades ' +
+                'pertencentes a contas diferentes, com quantidades ' +
+                'semelhantes ou iguais de tropas defensivas. Esse padrão ' +
+                'pode ser observado em ilhas com suspeita de multicontas.'
+        },
+
+        feiticos: {
+            titulo: 'Uso massivo de feitiços por múltiplas contas',
+
+            mensagem:
+                'Há indícios de uso massivo e recorrente de feitiços, ' +
+                'especialmente relâmpagos, por múltiplas contas, prática ' +
+                'observada em situações de invasão de regiões. Esse padrão ' +
+                'levanta suspeitas sobre a utilização coordenada de ' +
+                'multicontas. Solicito a análise dos registros e dos ' +
+                'vínculos entre as contas envolvidas.',
+
+            dica:
+                'Dica: reúna capturas de tela dos relâmpagos recebidos ' +
+                'para apresentar como evidência, se necessário.'
+        },
+
+        negociacaoPontos: {
+            titulo: 'Estes jogadores negociando/comprando/utilizando pontos de combate e/ou ouro',
+
+            mensagem:
+                'Este jogador está conseguindo pontos de combate de forma totalmente anormal e provavelmente através de navios colonizadores, por negociação ou produção utilizando multicontas para produzir os colonizadores. Uma verificação da muralha do jogador deve identificar um número anormal de navios colonizadores registrados ao atacar cidades; pode variar de, no mínimo, 50% até mais de 80% dos pontos totais de combate daquele jogador serem feitos por navios colonizadores em ataques contra multicontas.',
+
+            dica:
+                'Dica: utilize prints da pontuação de combate no jogo, mostrando que ela está muito mais alta que a pontuação de defensor e a pontuação de atacante na classificação.'
+        },
+
+        atividade24h: {
+            titulo: 'Atividade 24h com intervalos regulares',
+
+            mensagem:
+                'As contas aparentam manter atividade ao longo de 24 horas, ' +
+                'com intervalos regulares entre as ações. Esse padrão ' +
+                'levanta suspeitas de automação e utilização de ' +
+                'scripts/bots de gerenciamento externo ou interno. Solicito ' +
+                'a verificação dos registros para determinar se a atividade ' +
+                'é compatível com as regras do jogo, além de costumarem ' +
+                'apresentar padrões de produção de tropas semelhantes entre si.',
+
+            dicaMulticontas:
+                'Dica: tenha prints de atividades conjuntas ou de tropas ' +
+                'iguais nas cidades das contas selecionadas.'
+        },
+
+        atividadeScripts: {
+            titulo: 'Atividade contínua de 24h sem pausas e coleta automática de recurso',
+
+            mensagem:
+                'As contas aparentam manter atividade ao longo de 24 horas, ' +
+                'no máximo com intervalos regulares entre pequenos períodos durante ou após ' +
+                'o bônus noturno. Esse padrão levanta suspeitas de automação e ' +
+                'utilização de scripts/bots de gerenciamento externo ou interno. ' +
+                'Solicito a verificação dos registros para determinar se a atividade ' +
+                'é compatível com as regras do jogo.',
+
+            dica:
+                'Dica: infelizmente, não há como provar isso; apenas o próprio ' +
+                'sistema de detecção do jogo pode identificar esse comportamento.'
+        },
+
+        spamAtaques: {
+            titulo: 'Spam de ataque programado',
+
+            mensagem:
+                'Há suspeita de automação de ataques para atrapalhar a organização ' +
+                'dos comandos ou por outros motivos, como impedir que o jogador ' +
+                'acelere a produção de tropas com ouro.',
+
+            dica:
+                'Dica: tenha prints mostrando a repetição contínua dos ataques.'
+        }
+    };
+
+    const CHAVE_CATEGORIA_INICIAL =
+        'gp_ticket_categoria_inicializacao';
+
+    // Mesmas chaves usadas pelo coletor no jogo: GM_getValue compartilha
+    // os dados entre o Grepolis e o site de suporte neste userscript.
+    const CHAVE_SELECAO_SUPORTE = 'gp_multicontas_selecao_v1';
+    const CHAVE_MODO_SELECAO_SUPORTE = 'gp_multicontas_modo_selecao_v1';
+    const CHAVE_ESPERA_JOGADORES = 'gp_ticket_jogadores_espera_6h_v1';
+    const CHAVE_ACAO_PENDENTE_SUPORTE = 'gp_multicontas_acao_pendente_v1';
+
+    // Aplica a seleção solicitada pelo botão do jogo apenas uma vez.
+    // Jogadores em espera de 6h são ignorados para preservar a proteção existente.
+    function aplicarAcaoPendenteDoJogo() {
+        const acao = GM_getValue(CHAVE_ACAO_PENDENTE_SUPORTE, null);
+        if (!acao || !Array.isArray(acao.nomes) || !acao.nomes.length) return null;
+        GM_setValue(CHAVE_ACAO_PENDENTE_SUPORTE, null);
+
+        const agora = Date.now();
+        let esperas = GM_getValue(CHAVE_ESPERA_JOGADORES, {});
+        if (!esperas || typeof esperas !== 'object' || Array.isArray(esperas)) esperas = {};
+        const disponiveis = acao.nomes
+            .map(nome => String(nome || '').replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .filter(nome => !(Number(esperas[nome.toLocaleLowerCase()]) > agora));
+        const nomes = acao.tipo === 'jogador' ? disponiveis.slice(0, 1) : disponiveis.slice(0, 5);
+        GM_setValue(CHAVE_SELECAO_SUPORTE, nomes);
+        return { ...acao, nomes };
+    }
+
+    const acaoInicialDoJogo = aplicarAcaoPendenteDoJogo();
+    const DURACAO_ESPERA_JOGADOR = 6 * 60 * 60 * 1000;
+
+    const CHAVE_TIMER =
+        'gp_ticket_timer_fim';
+
+    const DURACAO_ESPERA = 5 * 60 * 1000;
+
+    if (document.querySelector('#gp-ticket-panel')) return;
+
+    const painel = document.createElement('div');
+    painel.id = 'gp-ticket-panel';
+
+    painel.style.cssText = `
+        position:fixed;
+        right:16px;
+        top:8px;
+        z-index:999999;
+        width:594px;
+        max-width:calc(100vw - 32px);
+        max-height:calc(100vh - 16px);
+        overflow-y:auto;
+        box-sizing:border-box;
+        padding:16px;
+        background:#fff;
+        border:1px solid #ccc;
+        border-radius:8px;
+        box-shadow:0 4px 18px #0002;
+        font:14px Arial,sans-serif;
+        color:#222;
+    `;
+
+    painel.innerHTML = `
+        <strong>Assistente de Denúncias Koyo's</strong>
+
+        <button id="gp-ticket-toggle-tipos" type="button" aria-expanded="false"
+            style="width:100%;margin-top:14px;padding:9px;cursor:pointer;font-weight:bold;text-align:left">
+            Selecionar o tipo de denúncia: ▸
+        </button>
+        <div id="gp-ticket-tipos" style="display:none;grid-template-columns:1fr;gap:7px;margin-top:8px">
+            <button class="gp-ticket-tipo" data-tipo="multicontas" type="button" aria-expanded="false"
+                style="width:100%;padding:10px;cursor:pointer;font-weight:bold">
+                Suspeita de multicontas utilizando VPN ou proxie.
+            </button>
+            <button class="gp-ticket-tipo" data-tipo="negociacao" type="button" aria-expanded="false"
+                style="width:100%;padding:10px;cursor:pointer;font-weight:bold">
+                Negociação externa de recursos e ponto de combate
+            </button>
+            <button class="gp-ticket-tipo" data-tipo="scripts" type="button" aria-expanded="false"
+                style="width:100%;padding:10px;cursor:pointer;font-weight:bold">
+                Report por utilização de scripts e bots
+            </button>
+        </div>
+
+        <div style="margin-top:8px;font-size:11px;color:#666">
+            A captura mais recente aparece primeiro. Jogadores adicionados anteriormente continuam guardados abaixo; selecione até 5 jogadores por lote.
+        </div>
+
+        <div id="gp-ticket-submenu" hidden>
+            <div id="gp-ticket-categorias" style="margin-top:12px;padding:10px;background:#f5f5f5;border-radius:6px">
+                <strong>Tipos de denúncia</strong>
+                <div style="margin-top:8px;font-size:11px;color:#666">Selecione os tipos de denúncia que deseja fazer.</div>
+                <div style="margin-top:5px;font-size:10px;color:#b8860b">Dica: tente juntar alguma prova sobre as acusações, principalmente prints dentro do jogo.</div>
+                <div id="gp-ticket-lista-categorias"></div>
+            </div>
+        </div>
+
+        <section id="gp-ticket-lista-container" style="margin-top:12px">
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+                <strong style="flex:1">Jogadores capturados</strong>
+                <button id="gp-ticket-limpar-selecao" type="button" style="padding:6px;cursor:pointer">Limpar seleção</button>
+            </div>
+            <div id="gp-ticket-lista-conteudo">
+                <button id="gp-ticket-toggle-selecionados" type="button" aria-expanded="false"
+                    style="width:100%;padding:7px 9px;margin-bottom:8px;cursor:pointer;font-weight:bold;text-align:left">
+                    Selecionados (0/5)
+                </button>
+                <div id="gp-ticket-selecionados-container" hidden
+                    style="padding:10px;background:#eaf5ec;border:1px solid #b9d8bf;border-radius:5px;font-size:15px;line-height:1.45;margin-bottom:8px">
+                    <div id="gp-ticket-jogadores-selecionados"></div>
+                </div>
+                <label for="gp-ticket-busca-jogadores" style="display:block;margin:0 0 6px;font-size:12px;font-weight:bold">Buscar jogador registrado para denúncia</label>
+                <input id="gp-ticket-busca-jogadores" type="search" autocomplete="off" placeholder="Digite o nome para filtrar..." aria-label="Buscar jogador registrado para denúncia nos registros salvos da ferramenta"
+                    style="box-sizing:border-box;width:100%;padding:8px;margin-bottom:8px;border:1px solid #aaa;border-radius:4px">
+                <details id="gp-ticket-aliancas-details" style="margin:0 0 8px;border:1px solid #ddd;border-radius:5px;background:#fafafa">
+                    <summary style="padding:8px;cursor:pointer;font-weight:bold">Buscar aliança: selecionar por aliança</summary>
+                    <div style="padding:8px">
+                        <label for="gp-ticket-busca-aliancas" style="display:block;margin:0 0 6px;font-size:12px;font-weight:bold">Buscar aliança e priorizar não ou menos reportados</label>
+                        <input id="gp-ticket-busca-aliancas" type="search" autocomplete="off" placeholder="Digite o nome da aliança..." aria-label="Buscar aliança"
+                            style="box-sizing:border-box;width:100%;padding:8px;margin-bottom:6px;border:1px solid #aaa;border-radius:4px">
+                        <div id="gp-ticket-lista-aliancas" style="padding:6px 8px;margin-bottom:2px;background:#fff;border:1px solid #e2e2e2;border-radius:4px;font-size:13px">Carregando alianças...</div>
+                    </div>
+                </details>
+                <details id="gp-ticket-registros-details" style="margin-bottom:8px;border:1px solid #ddd;border-radius:5px;background:#fafafa">
+                    <summary style="padding:8px;cursor:pointer;font-weight:bold">Contas e alianças registradas</summary>
+                    <div id="gp-ticket-pastas-container" style="padding:8px">
+                    <div id="gp-ticket-lista-disponiveis"
+                        style="padding:10px;background:#f5f5f5;border-radius:5px;font-size:15px;line-height:1.45">
+                        Carregando jogadores capturados...
+                    </div>
+                    </div>
+                </details>
+
+            </div>
+        </section>
+
+        <label for="gp-ticket-title"
+            style="display:block;margin-top:14px">
+            Título
+        </label>
+
+        <input id="gp-ticket-title"
+            style="box-sizing:border-box;width:100%;
+            padding:8px;margin-top:4px">
+
+        <label for="gp-ticket-message"
+            style="display:block;margin-top:10px">
+            Mensagem
+        </label>
+
+        <textarea id="gp-ticket-message" rows="8"
+            style="box-sizing:border-box;width:100%;
+            padding:8px;margin-top:4px;resize:vertical"></textarea>
+
+        <button id="gp-ticket-fill" type="button"
+            style="margin-top:8px;padding:9px 12px;cursor:pointer">
+            Preencher formulário
+        </button>
+
+        <div id="gp-ticket-status"
+            role="status" aria-live="polite"
+            style="margin-top:10px;font-size:12px"></div>
+
+        <div id="gp-ticket-timer"
+            role="status" aria-live="polite"
+            style="margin-top:10px;padding:10px;
+            background:#f4f4f4;border-radius:5px;text-align:center">
+            Temporizador inativo.
+        </div>
+
+        <button id="gp-ticket-test-sound" type="button"
+            style="margin-top:8px;padding:6px;cursor:pointer">
+            Testar som
+        </button>
+    `;
+
+    document.body.appendChild(painel);
+
+    const tituloInput =
+        painel.querySelector('#gp-ticket-title');
+
+    const mensagemInput =
+        painel.querySelector('#gp-ticket-message');
+
+    const status =
+        painel.querySelector('#gp-ticket-status');
+
+    const botaoPreencher =
+        painel.querySelector('#gp-ticket-fill');
+
+    const timerStatus =
+        painel.querySelector('#gp-ticket-timer');
+
+    const botaoSom =
+        painel.querySelector('#gp-ticket-test-sound');
+
+    const botoesTipo = [...painel.querySelectorAll('.gp-ticket-tipo')];
+    const submenu = painel.querySelector('#gp-ticket-submenu');
+    let tipoAtivo = null;
+
+    const TIPOS_RELATORIO = {
+        multicontas: {
+            titulo: 'Suspeita de multicontas utilizando VPN ou proxie.',
+            categorias: ['colonizadores', 'defesa', 'feiticos', 'atividade24h'],
+            mensagemBase: MENSAGEM_BASE_MULTICONTAS
+        },
+        negociacao: {
+            titulo: 'Negociação externa de recursos e ponto de combate',
+            categorias: ['negociacaoPontos'],
+            mensagemBase: 'Olá, equipe de suporte.\n\nSolicito a análise da atividade descrita abaixo, que pode indicar negociação, compra ou utilização irregular de pontos de combate e/ou ouro.\n\n'
+        },
+        scripts: {
+            titulo: 'Suspeita de utilização de scripts e bots',
+            categorias: ['atividadeScripts', 'spamAtaques'],
+            mensagemBase: 'Olá, equipe de suporte.\n\nSolicito a análise dos padrões de atividade descritos abaixo, que podem indicar utilização de scripts ou bots.\n\n'
+        }
+    };
+
+    const jogadoresSelecionadosInfo =
+        painel.querySelector('#gp-ticket-jogadores-selecionados');
+    const selecionadosContainer =
+        painel.querySelector('#gp-ticket-selecionados-container');
+    const botaoToggleSelecionados =
+        painel.querySelector('#gp-ticket-toggle-selecionados');
+    const listaDisponiveisInfo =
+        painel.querySelector('#gp-ticket-lista-disponiveis');
+    let selecionadosVisiveis = true;
+    selecionadosContainer.hidden = false;
+    botaoToggleSelecionados.setAttribute('aria-expanded', 'true');
+    // Preserva o estado aberto/fechado das pastas entre atualizações da lista.
+    const estadoPastas = new Map();
+    const detalhesRegistros = painel.querySelector('#gp-ticket-registros-details');
+    if (acaoInicialDoJogo) {
+        selecionadosContainer.hidden = false;
+        if (botaoToggleSelecionados) botaoToggleSelecionados.setAttribute('aria-expanded', 'true');
+        if (detalhesRegistros) detalhesRegistros.open = true;
+    }
+    const campoBuscaJogadores = painel.querySelector('#gp-ticket-busca-jogadores');
+    const campoBuscaAliancas = painel.querySelector('#gp-ticket-busca-aliancas');
+    const listaAliancas = painel.querySelector('#gp-ticket-lista-aliancas');
+    listaAliancas.style.display = 'none';
+    const detalhesAliancas = painel.querySelector('#gp-ticket-aliancas-details');
+    detalhesAliancas.open = false;
+    const botaoToggleTipos = painel.querySelector('#gp-ticket-toggle-tipos');
+    const listaTipos = painel.querySelector('#gp-ticket-tipos');
+    botaoToggleTipos.addEventListener('click', () => {
+        const abrir = listaTipos.style.display === 'none';
+        listaTipos.style.display = abrir ? 'grid' : 'none';
+        botaoToggleTipos.setAttribute('aria-expanded', String(abrir));
+        botaoToggleTipos.textContent = abrir
+            ? 'Selecionar o tipo de denúncia: ▾'
+            : 'Selecionar o tipo de denúncia: ▸';
+    });
+    let gruposAliançasAtuais = [];
+    campoBuscaAliancas.addEventListener('input', () => {
+        if (campoBuscaAliancas.value.trim()) detalhesAliancas.open = true;
+        renderizarBuscaAliancas();
+    });
+    campoBuscaJogadores.addEventListener('input', () => {
+        quantidadeJogadoresVisiveis = 10;
+        atualizarResumoJogadoresSelecionados();
+    });
+    let quantidadeJogadoresVisiveis = 10;
+    botaoToggleSelecionados.addEventListener('click', () => {
+        selecionadosVisiveis = !selecionadosVisiveis;
+        selecionadosContainer.hidden = !selecionadosVisiveis;
+        botaoToggleSelecionados.setAttribute('aria-expanded', String(selecionadosVisiveis));
+        atualizarResumoJogadoresSelecionados();
+    });
+
+
+    function renderizarBuscaAliancas() {
+        if (!listaAliancas) return;
+        const consulta = String(campoBuscaAliancas?.value || '').trim().toLocaleLowerCase();
+        listaAliancas.style.display = consulta ? 'block' : 'none';
+        if (!consulta) {
+            listaAliancas.replaceChildren();
+            return;
+        }
+        const normalizar = texto => String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase();
+        const grupos = (gruposAliançasAtuais || []).filter(grupo =>
+            !consulta || normalizar(grupo.nome).includes(normalizar(consulta))
+        );
+        listaAliancas.replaceChildren();
+        if (!grupos.length) {
+            listaAliancas.textContent = 'Nenhuma aliança encontrada.';
+            return;
+        }
+        for (const grupo of grupos) {
+            const label = document.createElement('label');
+            label.style.cssText = 'display:flex;align-items:center;gap:7px;padding:4px 0;cursor:pointer';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.setAttribute('aria-label', `Selecionar até cinco jogadores de ${grupo.nome}`);
+            const nome = document.createElement('span');
+            nome.textContent = `${grupo.nome} (${grupo.registros.filter(r => r.tipo === 'jogador' && !nomeEmEspera(r.nome)).length} disponíveis)`;
+            checkbox.addEventListener('change', () => {
+                if (!checkbox.checked) return;
+                const selecionados = obterSelecaoParaSuporte().nomes;
+                const existentes = new Set(selecionados.map(chaveJogador));
+                const esperas = lerJogadoresEmEspera();
+                const candidatos = grupo.registros
+                    .filter(r => r.tipo === 'jogador' && !nomeEmEspera(r.nome, esperas) && !existentes.has(chaveJogador(r.nome)))
+                    .sort((a, b) => {
+                        // Primeiro prioriza contas ainda pendentes; depois, menor
+                        // quantidade de reportes registrados; por fim, ordem alfabética.
+                        const estadoA = a.estado === 'reportado' ? 1 : 0;
+                        const estadoB = b.estado === 'reportado' ? 1 : 0;
+                        return estadoA - estadoB ||
+                            (Number(a.reportes) || 0) - (Number(b.reportes) || 0) ||
+                            a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' });
+                    });
+                let adicionados = 0;
+                for (const registro of candidatos) {
+                    if (selecionados.length >= 5) break;
+                    selecionados.push(registro.nome);
+                    existentes.add(chaveJogador(registro.nome));
+                    adicionados++;
+                }
+                checkbox.checked = false;
+                GM_setValue(CHAVE_SELECAO_SUPORTE, selecionados);
+                atualizarResumoJogadoresSelecionados();
+                definirStatus(adicionados
+                    ? `${adicionados} jogador(es) selecionado(s) da aliança "${grupo.nome}", priorizando os menos reportados.`
+                    : 'Não há jogadores disponíveis dessa aliança para completar a seleção.');
+            });
+            label.append(checkbox, nome);
+            listaAliancas.appendChild(label);
+        }
+    }
+
+    function lerJogadoresEmEspera() {
+        const agora = Date.now();
+        let dados = GM_getValue(CHAVE_ESPERA_JOGADORES, {});
+        if (!dados || typeof dados !== 'object' || Array.isArray(dados)) dados = {};
+        const ativos = {};
+        for (const [chave, fim] of Object.entries(dados)) {
+            if (Number(fim) > agora) ativos[chave] = Number(fim);
+        }
+        if (Object.keys(ativos).length !== Object.keys(dados).length) {
+            GM_setValue(CHAVE_ESPERA_JOGADORES, ativos);
+        }
+        return ativos;
+    }
+
+    function nomeEmEspera(nome, esperas = lerJogadoresEmEspera()) {
+        return Number(esperas[String(nome).toLocaleLowerCase()]) > Date.now();
+    }
+
+    // Qualquer jogador ainda em cooldown deve aparecer na subpasta "Já reportados",
+    // inclusive os que entraram em espera antes da introdução das pastas.
+    function sincronizarReportadosComCooldown(registros = lerJogadoresGuardados()) {
+        const esperas = lerJogadoresEmEspera();
+        let alterados = false;
+
+        for (const registro of registros) {
+            if (nomeEmEspera(registro.nome, esperas) && registro.estado !== 'reportado') {
+                registro.estado = 'reportado';
+                alterados = true;
+            }
+        }
+
+        if (alterados) salvarJogadoresGuardados(registros);
+        return registros;
+    }
+
+    function formatarEspera(fim) {
+        const restante = Math.max(0, Number(fim) - Date.now());
+        const horas = Math.floor(restante / 3600000);
+        const minutos = Math.floor((restante % 3600000) / 60000);
+        return `${horas}h ${String(minutos).padStart(2, '0')}min`;
+    }
+
+    painel.querySelector('#gp-ticket-limpar-selecao').addEventListener('click', () => {
+        GM_setValue(CHAVE_SELECAO_SUPORTE, []);
+        atualizarResumoJogadoresSelecionados();
+    });
+
+    const painelCategorias =
+        painel.querySelector('#gp-ticket-categorias');
+
+    const listaCategorias =
+        painel.querySelector('#gp-ticket-lista-categorias');
+
+    let timerInterval = null;
+    let avisoDetectado = false;
+
+    const categoriasSelecionadas = new Set();
+
+    function definirStatus(texto, sucesso = false) {
+        status.textContent = texto;
+        status.style.color = sucesso ? '#18794e' : '#8a5800';
+    }
+
+    // Monta os botões das subcategorias e suas dicas visuais.
+    for (const [id, categoria] of Object.entries(SUBCATEGORIAS)) {
+        const item = document.createElement('div');
+
+        item.dataset.categoria = id;
+        item.style.cssText = `
+            margin-top:8px;
+            padding:7px 8px;
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:5px;
+        `;
+
+        const botaoCategoria = document.createElement('button');
+
+        botaoCategoria.type = 'button';
+        botaoCategoria.textContent = categoria.titulo;
+        botaoCategoria.setAttribute('aria-pressed', 'false');
+
+        botaoCategoria.style.cssText = `
+            display:block;
+            width:100%;
+            padding:8px;
+            text-align:left;
+            cursor:pointer;
+            border:1px solid #bbb;
+            border-radius:4px;
+            background:#fff;
+            color:#222;
+            font-weight:normal;
+        `;
+
+        item.appendChild(botaoCategoria);
+
+        if (categoria.dica || categoria.dicaMulticontas) {
+            const dica = document.createElement('div');
+            dica.textContent = categoria.dica || categoria.dicaMulticontas;
+            dica.style.cssText = `
+                display:none;
+                margin:6px 2px 0;
+                padding:6px 8px;
+                font-size:11px;
+                line-height:1.4;
+                color:#555;
+                background:#f7f7f7;
+                border-radius:4px;
+            `;
+            item.appendChild(dica);
+            botaoCategoria.setAttribute('aria-expanded', 'false');
+            botaoCategoria.addEventListener('click', () => {
+                const mostrarDica = dica.style.display === 'none';
+                dica.style.display = mostrarDica ? 'block' : 'none';
+                botaoCategoria.setAttribute('aria-expanded', String(mostrarDica));
+            });
+        }
+
+        botaoCategoria.addEventListener('click', () => {
+            if (categoriasSelecionadas.has(id)) {
+                categoriasSelecionadas.delete(id);
+            } else {
+                categoriasSelecionadas.add(id);
+            }
+
+            const selecionada = categoriasSelecionadas.has(id);
+
+            botaoCategoria.setAttribute(
+                'aria-pressed',
+                String(selecionada)
+            );
+
+            botaoCategoria.style.background =
+                selecionada ? '#e5f5e9' : '#fff';
+
+            botaoCategoria.style.borderColor =
+                selecionada ? '#18794e' : '#bbb';
+
+            botaoCategoria.style.fontWeight =
+                selecionada ? 'bold' : 'normal';
+
+            atualizarMensagemMulticontas();
+        });
+
+        listaCategorias.appendChild(item);
+    }
+
+    function obterSelecaoParaSuporte() {
+        const nomesBrutos = GM_getValue(CHAVE_SELECAO_SUPORTE, []);
+        const nomes = Array.isArray(nomesBrutos)
+            ? nomesBrutos.map(nome => String(nome || '').replace(/\s+/g, ' ').trim()).filter(Boolean)
+            : [];
+        const unicos = [...new Map(nomes.map(nome => [nome.toLocaleLowerCase(), nome])).values()];
+        return { nomes: unicos, limite: 5, valido: unicos.length >= 1 && unicos.length <= 5 };
+    }
+
+    function atualizarResumoJogadoresSelecionados() {
+        const registros = sincronizarReportadosComCooldown(lerJogadoresGuardados());
+        const selecionados = obterSelecaoParaSuporte().nomes;
+        const esperas = lerJogadoresEmEspera();
+
+        // Guarda o estado atual antes de reconstruir a árvore; pastas só abrem por clique.
+        listaDisponiveisInfo.querySelectorAll('details[data-state-key]').forEach(pasta => {
+            estadoPastas.set(pasta.dataset.stateKey, pasta.open);
+        });
+        jogadoresSelecionadosInfo.replaceChildren();
+        listaDisponiveisInfo.replaceChildren();
+
+        const jogadores = registros.filter(r => r.tipo === 'jogador');
+        const emEspera = jogadores.filter(r => nomeEmEspera(r.nome, esperas));
+        const disponiveis = jogadores.filter(r => !nomeEmEspera(r.nome, esperas));
+        const selecionadosSet = new Set(selecionados.map(chaveJogador));
+
+        const consulta = String(campoBuscaJogadores.value || '')
+            .trim()
+            .toLocaleLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '');
+
+        const correspondeBusca = registro => {
+            if (!consulta) return true;
+            return registro.nome
+                .toLocaleLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .includes(consulta);
+        };
+
+        const ultimaCapturaBruta = GM_getValue(CHAVE_ULTIMA_CAPTURA, []);
+        const ultimaCaptura = Array.isArray(ultimaCapturaBruta)
+            ? ultimaCapturaBruta.map(normalizarNome).filter(Boolean)
+            : [];
+        const chavesUltimaCaptura = new Set(ultimaCaptura.map(chaveJogador));
+
+        const selecionadosRegistrados = disponiveis.filter(
+            r => selecionadosSet.has(chaveJogador(r.nome))
+        );
+
+        const haReportadosSelecionados = registros.some(
+            registro => registro.tipo === 'jogador' &&
+                registro.estado === 'reportado' &&
+                selecionadosSet.has(chaveJogador(registro.nome))
+        );
+        botaoToggleSelecionados.textContent =
+            `${haReportadosSelecionados ? '⚠ ' : ''}Selecionados (${selecionados.length}/5)`;
+        botaoToggleSelecionados.style.background =
+            selecionados.length ? '#e5f5e9' : '';
+        botaoToggleSelecionados.style.borderColor =
+            selecionados.length ? '#18794e' : '';
+
+        const cabecalhoSelecionados = document.createElement('div');
+        cabecalhoSelecionados.textContent = selecionados.length
+            ? 'Jogadores selecionados para o próximo lote:'
+            : 'Nenhum jogador selecionado.';
+        cabecalhoSelecionados.style.cssText =
+            'font-weight:bold;margin-bottom:6px';
+        jogadoresSelecionadosInfo.appendChild(cabecalhoSelecionados);
+
+        const nomesReportadosSelecionados = registros.filter(
+            registro => registro.tipo === 'jogador' &&
+                registro.estado === 'reportado' &&
+                selecionadosSet.has(chaveJogador(registro.nome))
+        );
+        if (nomesReportadosSelecionados.length) {
+            const avisoReportados = document.createElement('div');
+            avisoReportados.textContent = '⚠ Contas já reportadas selecionadas: ' +
+                nomesReportadosSelecionados.map(registro => registro.nome).join(', ');
+            avisoReportados.setAttribute('role', 'alert');
+            avisoReportados.style.cssText =
+                'margin:0 0 8px;padding:7px 9px;background:#fff0f0;' +
+                'border:1px solid #d93025;border-radius:4px;color:#b00020;' +
+                'font-weight:bold;font-size:13px';
+            jogadoresSelecionadosInfo.appendChild(avisoReportados);
+        }
+
+        const renderizarJogadorSelecionado = registro => {
+            const linha = document.createElement('label');
+            linha.style.cssText =
+                'display:flex;align-items:center;gap:7px;padding:4px 0;' +
+                'border-bottom:1px solid #d7e7da;cursor:pointer';
+
+            const check = document.createElement('input');
+            check.type = 'checkbox';
+            check.checked = true;
+
+            check.addEventListener('change', () => {
+                let atuais = obterSelecaoParaSuporte().nomes;
+                atuais = atuais.filter(
+                    nome => chaveJogador(nome) !== chaveJogador(registro.nome)
+                );
+                GM_setValue(CHAVE_SELECAO_SUPORTE, atuais);
+                atualizarResumoJogadoresSelecionados();
+            });
+
+            const nome = document.createElement('span');
+            nome.textContent = registro.nome;
+            nome.style.fontWeight = 'bold';
+
+            linha.append(check, nome);
+            jogadoresSelecionadosInfo.appendChild(linha);
+        };
+
+        selecionadosRegistrados.forEach(renderizarJogadorSelecionado);
+
+        if (!registros.length) {
+            listaDisponiveisInfo.textContent =
+                'Nenhum jogador capturado. Volte ao jogo ou ao GrepoData e capture jogadores.';
+            listaDisponiveisInfo.style.color = '#8a5800';
+            return false;
+        }
+
+        const cabecalho = document.createElement('div');
+        cabecalho.textContent =
+            `Capturados: ${jogadores.length}. ` +
+            `Pendentes: ${jogadores.filter(r => r.estado !== 'reportado').length}. ` +
+            `Já reportados: ${jogadores.filter(r => r.estado === 'reportado').length}. ` +
+            `Em espera de 6h: ${emEspera.length}. ` +
+            `Selecionados: ${selecionados.length}/5.`;
+        cabecalho.style.cssText =
+            'font-weight:bold;margin-bottom:8px';
+        listaDisponiveisInfo.appendChild(cabecalho);
+
+        const grupos = new Map();
+
+        for (const registro of jogadores) {
+            const grupo = registro.grupo || GRUPO_LEGADO;
+            const chaveGrupo =
+                `${grupo.tipo}:${chaveJogador(grupo.nome)}`;
+
+            if (!grupos.has(chaveGrupo)) {
+                grupos.set(chaveGrupo, {
+                    tipo: grupo.tipo,
+                    nome: normalizarTexto(grupo.nome) || GRUPO_LEGADO.nome,
+                    registros: []
+                });
+            }
+
+            grupos.get(chaveGrupo).registros.push(registro);
+        }
+
+        const ordemGrupos = [...grupos.values()].sort((a, b) =>
+            a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' })
+        );
+
+        gruposAliançasAtuais = ordemGrupos.filter(grupo => grupo.tipo === 'alianca');
+        renderizarBuscaAliancas();
+
+        const renderizarJogador = registro => {
+            const linha = document.createElement('label');
+            linha.style.cssText =
+                'display:flex;align-items:center;gap:7px;padding:4px 0;' +
+                'border-bottom:1px solid #e5e5e5;cursor:pointer';
+
+            const check = document.createElement('input');
+            check.type = 'checkbox';
+            check.checked = false;
+
+            check.addEventListener('change', () => {
+                let atuais = obterSelecaoParaSuporte().nomes;
+                const chave = chaveJogador(registro.nome);
+
+                if (check.checked) {
+                    if (nomeEmEspera(registro.nome)) {
+                        check.checked = false;
+                        definirStatus(
+                            'Este jogador está na espera de 6 horas após ter sido usado em um lote.'
+                        );
+                        atualizarResumoJogadoresSelecionados();
+                        return;
+                    }
+
+                    if (atuais.length >= 5) {
+                        check.checked = false;
+                        definirStatus(
+                            'Cada lote pode conter no máximo 5 jogadores. Aguarde o temporizador para enviar outro lote.'
+                        );
+                        return;
+                    }
+
+                    if (!atuais.some(nome => chaveJogador(nome) === chave)) {
+                        atuais.push(registro.nome);
+                    }
+                } else {
+                    atuais = atuais.filter(nome => chaveJogador(nome) !== chave);
+                }
+
+                GM_setValue(CHAVE_SELECAO_SUPORTE, atuais);
+                atualizarResumoJogadoresSelecionados();
+            });
+
+            const nome = document.createElement('span');
+            nome.textContent = registro.nome;
+
+            const quantidadeReportes = String(
+                Math.max(0, Math.floor(Number(registro.reportes) || 0))
+            ).padStart(2, '0');
+
+            const estado = registro.estado === 'reportado'
+                ? `Já reportado (${quantidadeReportes})`
+                : 'Pendente';
+
+            const etiqueta = document.createElement('span');
+            etiqueta.textContent = estado;
+            etiqueta.style.cssText =
+                'margin-left:auto;font-size:11px;padding:2px 5px;border-radius:4px;' +
+                (registro.estado === 'reportado'
+                    ? 'background:#e9ecef;color:#666'
+                    : 'background:#fff3cd;color:#8a5800');
+
+            if (
+                consulta &&
+                registro.nome
+                    .toLocaleLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .includes(consulta)
+            ) {
+                nome.style.cssText =
+                    'font-weight:bold;background:#fff1a8;border-radius:3px;padding:1px 3px';
+                linha.style.background = '#fffbe6';
+            }
+
+            linha.append(check, nome, etiqueta);
+            return linha;
+        };
+
+        for (const grupo of ordemGrupos) {
+            const registrosGrupo = grupo.registros.filter(correspondeBusca);
+            if (!registrosGrupo.length) continue;
+
+            const blocoGrupo = document.createElement('details');
+            const chaveEstadoGrupo = `grupo:${grupo.tipo}:${grupo.nome}`;
+            blocoGrupo.dataset.stateKey = chaveEstadoGrupo;
+            const acaoGrupo = acaoInicialDoJogo?.grupo;
+            const correspondeAcao = acaoGrupo &&
+                String(acaoGrupo.nome || '').toLocaleLowerCase() === String(grupo.nome || '').toLocaleLowerCase() &&
+                acaoGrupo.tipo === grupo.tipo;
+            blocoGrupo.open = correspondeAcao ? true : (estadoPastas.get(chaveEstadoGrupo) ?? false);
+            blocoGrupo.style.cssText =
+                'margin-top:8px;border:1px solid #d8d8d8;border-radius:6px;' +
+                'background:#fff;overflow:hidden';
+
+            const pendentes = registrosGrupo.filter(
+                registro =>
+                    registro.estado !== 'reportado' &&
+                    !selecionadosSet.has(chaveJogador(registro.nome))
+            );
+
+            const reportados = registrosGrupo.filter(
+                registro =>
+                    registro.estado === 'reportado' &&
+                    !selecionadosSet.has(chaveJogador(registro.nome))
+            );
+
+            const resumoGrupo = document.createElement('summary');
+            resumoGrupo.style.cssText =
+                'cursor:pointer;padding:8px;font-weight:bold;background:#f5f5f5';
+
+            const iconeGrupo = grupo.tipo === 'alianca'
+                ? '📁'
+                : grupo.tipo === 'perfil'
+                    ? '👤'
+                    : '📁';
+
+            resumoGrupo.textContent =
+                `${iconeGrupo} ${grupo.nome} ` +
+                `(${pendentes.length} pendente${pendentes.length === 1 ? '' : 's'} · ` +
+                `${reportados.length} reportado${reportados.length === 1 ? '' : 's'})`;
+
+            blocoGrupo.appendChild(resumoGrupo);
+            blocoGrupo.addEventListener('toggle', () => {
+                estadoPastas.set(chaveEstadoGrupo, blocoGrupo.open);
+            });
+
+            const corpoGrupo = document.createElement('div');
+            corpoGrupo.style.cssText = 'padding:6px 8px 8px';
+
+            const renderizarSubpasta = (titulo, registrosSubpasta, aberta) => {
+                if (!registrosSubpasta.length) return;
+
+                const subpasta = document.createElement('details');
+                const chaveEstadoSubpasta = `${chaveEstadoGrupo}:sub:${titulo}`;
+                subpasta.dataset.stateKey = chaveEstadoSubpasta;
+                subpasta.open = estadoPastas.get(chaveEstadoSubpasta) ?? false;
+                subpasta.style.cssText =
+                    'margin-top:5px;border:1px solid #e2e2e2;border-radius:5px';
+
+                const resumo = document.createElement('summary');
+                resumo.style.cssText =
+                    'cursor:pointer;padding:6px;background:#fafafa;font-size:12px;font-weight:bold';
+
+                resumo.textContent =
+                    `${titulo} (${registrosSubpasta.length})`;
+
+                subpasta.appendChild(resumo);
+                subpasta.addEventListener('toggle', () => {
+                    estadoPastas.set(chaveEstadoSubpasta, subpasta.open);
+                });
+
+                const lista = document.createElement('div');
+                lista.style.cssText = 'padding:2px 7px 5px';
+
+                const recentes = registrosSubpasta.filter(
+                    registro => chavesUltimaCaptura.has(chaveJogador(registro.nome))
+                );
+                const anteriores = registrosSubpasta.filter(
+                    registro => !chavesUltimaCaptura.has(chaveJogador(registro.nome))
+                );
+
+                const ordenados = [...recentes, ...anteriores];
+
+                ordenados.slice(0, quantidadeJogadoresVisiveis).forEach(registro => {
+                    lista.appendChild(renderizarJogador(registro));
+                });
+
+                if (ordenados.length > quantidadeJogadoresVisiveis) {
+                    const mostrarMais = document.createElement('button');
+                    mostrarMais.type = 'button';
+                    mostrarMais.textContent =
+                        `Mostrar mais (${ordenados.length - quantidadeJogadoresVisiveis} restantes)`;
+                    mostrarMais.style.cssText =
+                        'margin-top:8px;padding:6px 10px;cursor:pointer';
+
+                    mostrarMais.addEventListener('click', () => {
+                        quantidadeJogadoresVisiveis += 10;
+                        atualizarResumoJogadoresSelecionados();
+                    });
+
+                    lista.appendChild(mostrarMais);
+                }
+
+                subpasta.appendChild(lista);
+                corpoGrupo.appendChild(subpasta);
+            };
+
+            renderizarSubpasta('📌 Pendentes', pendentes, true);
+            renderizarSubpasta('✓ Já reportados', reportados, false);
+
+            blocoGrupo.appendChild(corpoGrupo);
+            listaDisponiveisInfo.appendChild(blocoGrupo);
+        }
+
+        if (!ordemGrupos.length) {
+            const vazio = document.createElement('div');
+            vazio.textContent =
+                'Nenhum jogador corresponde à busca atual.';
+            vazio.style.cssText = 'padding:8px 0;color:#8a5800';
+            listaDisponiveisInfo.appendChild(vazio);
+        }
+
+        if (emEspera.length) {
+            const esperaFiltrada = emEspera.filter(correspondeBusca);
+
+            if (esperaFiltrada.length) {
+                const blocoEspera = document.createElement('details');
+                blocoEspera.open = Boolean(consulta);
+                blocoEspera.style.cssText =
+                    'margin-top:10px;padding-top:8px;border-top:1px solid #ddd';
+
+                const resumoEspera = document.createElement('summary');
+                resumoEspera.textContent =
+                    `Em espera por 6 horas (${esperaFiltrada.length}${consulta ? ` de ${emEspera.length}` : ''})`;
+                resumoEspera.style.cursor = 'pointer';
+
+                blocoEspera.appendChild(resumoEspera);
+
+                esperaFiltrada.forEach(registro => {
+                    const item = document.createElement('div');
+                    item.style.cssText =
+                        'padding:3px 0;color:#777;font-size:12px';
+                    item.textContent =
+                        `${registro.nome} — disponível em ${formatarEspera(esperas[chaveJogador(registro.nome)])}`;
+
+                    if (consulta) {
+                        item.style.fontWeight = 'bold';
+                        item.style.background = '#fffbe6';
+                    }
+
+                    blocoEspera.appendChild(item);
+                });
+
+                listaDisponiveisInfo.appendChild(blocoEspera);
+            }
+        }
+
+        listaDisponiveisInfo.style.color = '#222';
+        return true;
+    }
+
+    function atualizarMensagemMulticontas() {
+        const selecao = obterSelecaoParaSuporte();
+        if (!selecao.valido) {
+            atualizarResumoJogadoresSelecionados();
+            definirStatus(
+                `Selecione de 1 a 5 jogadores na lista do suporte para preparar este lote.`
+            );
+            return;
+        }
+
+        atualizarResumoJogadoresSelecionados();
+        const tipo = TIPOS_RELATORIO[tipoAtivo] || TIPOS_RELATORIO.multicontas;
+        const partes = [tipo.mensagemBase.trimEnd()];
+
+        for (const [id, categoria] of Object.entries(SUBCATEGORIAS)) {
+            if (tipo.categorias.includes(id) && categoriasSelecionadas.has(id)) {
+                partes.push(categoria.mensagem);
+            }
+        }
+
+        tituloInput.value = tipo.titulo;
+        mensagemInput.value = partes.join('\n\n');
+
+        definirStatus(
+            `${selecao.nomes.length} jogador(es) incluído(s). ` +
+            (categoriasSelecionadas.size
+                ? `${categoriasSelecionadas.size} tipo(s) de denúncia selecionado(s).`
+                : 'Modelo de multicontas preparado.'),
+            true
+        );
+    }
+
+    function abrirTipoRelatorio(tipo) {
+        tipoAtivo = tipo;
+        const configuracao = TIPOS_RELATORIO[tipo];
+        categoriasSelecionadas.clear();
+        for (const item of listaCategorias.children) {
+            const visivel = configuracao.categorias.includes(item.dataset.categoria);
+            item.hidden = !visivel;
+            const botaoCategoria = item.querySelector('button[aria-pressed]');
+            if (botaoCategoria) {
+                botaoCategoria.setAttribute('aria-pressed', 'false');
+                botaoCategoria.style.background = '#fff';
+                botaoCategoria.style.borderColor = '#bbb';
+                botaoCategoria.style.fontWeight = 'normal';
+                botaoCategoria.setAttribute('aria-expanded', 'false');
+                const dica = item.querySelector('div');
+                if (dica && (SUBCATEGORIAS[item.dataset.categoria].dica || SUBCATEGORIAS[item.dataset.categoria].dicaMulticontas)) {
+                    dica.hidden = true;
+                    dica.textContent = tipo === 'multicontas'
+                        ? (SUBCATEGORIAS[item.dataset.categoria].dicaMulticontas || SUBCATEGORIAS[item.dataset.categoria].dica || '')
+                        : (SUBCATEGORIAS[item.dataset.categoria].dica || '');
+                }
+            }
+        }
+        for (const botao of botoesTipo) {
+            const ativo = botao.dataset.tipo === tipo;
+            botao.setAttribute('aria-expanded', String(ativo));
+            botao.style.background = ativo ? '#e5f5e9' : '';
+            botao.style.borderColor = ativo ? '#18794e' : '';
+        }
+        submenu.hidden = false;
+        atualizarMensagemMulticontas();
+    }
+
+    for (const botao of botoesTipo) {
+        botao.addEventListener('click', () => {
+            const tipo = botao.dataset.tipo;
+            if (tipoAtivo === tipo && !submenu.hidden) {
+                submenu.hidden = true;
+                tipoAtivo = null;
+                botao.setAttribute('aria-expanded', 'false');
+                return;
+            }
+            abrirTipoRelatorio(tipo);
+        });
+    }
+
+    // Alerta sonoro original.
+    function tocarAlerta() {
+        try {
+            const AudioContextClass =
+                window.AudioContext || window.webkitAudioContext;
+
+            if (!AudioContextClass) {
+                timerStatus.textContent =
+                    'Tempo concluído! Seu navegador não permite o alerta sonoro.';
+                return;
+            }
+
+            const audio = new AudioContextClass();
+
+            audio.resume().then(() => {
+                [0, 0.35, 0.7].forEach((atraso) => {
+                    const oscilador = audio.createOscillator();
+                    const volume = audio.createGain();
+
+                    oscilador.type = 'sine';
+                    oscilador.frequency.value = 880;
+                    volume.gain.value = 0.18;
+
+                    oscilador.connect(volume);
+                    volume.connect(audio.destination);
+
+                    oscilador.start(audio.currentTime + atraso);
+                    oscilador.stop(audio.currentTime + atraso + 0.18);
+                });
+
+                setTimeout(() => audio.close(), 1500);
+            }).catch(() => {
+                timerStatus.textContent =
+                    'Tempo concluído! Clique em Testar som para habilitar o áudio.';
+            });
+        } catch (erro) {
+            console.warn(
+                '[Grepolis] Não foi possível tocar o alerta:',
+                erro
+            );
+        }
+    }
+
+    // Temporizador original.
+    function atualizarTimer() {
+        const fim = Number(sessionStorage.getItem(CHAVE_TIMER));
+
+        if (!fim) {
+            timerStatus.textContent = 'Temporizador inativo.';
+            return;
+        }
+
+        const restante = Math.max(0, fim - Date.now());
+
+        if (restante <= 0) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+
+            sessionStorage.removeItem(CHAVE_TIMER);
+
+            timerStatus.textContent =
+                'Tempo concluído! Você já pode voltar ao formulário.';
+
+            timerStatus.style.background = '#e5f5e9';
+            timerStatus.style.color = '#18794e';
+
+            if (!avisoDetectado) {
+                avisoDetectado = true;
+                tocarAlerta();
+                document.title = '⏰ Espera concluída — Grepolis';
+            }
+
+            return;
+        }
+
+        const minutos = Math.floor(restante / 60000);
+        const segundos = Math.floor((restante % 60000) / 1000);
+
+        timerStatus.textContent =
+            `Aguarde ${String(minutos).padStart(2, '0')}:` +
+            `${String(segundos).padStart(2, '0')}`;
+
+        timerStatus.style.background = '#fff3cd';
+        timerStatus.style.color = '#8a5800';
+    }
+
+    function iniciarTimer() {
+        if (!sessionStorage.getItem(CHAVE_TIMER)) {
+            sessionStorage.setItem(
+                CHAVE_TIMER,
+                String(Date.now() + DURACAO_ESPERA)
+            );
+        }
+
+        avisoDetectado = false;
+
+        if (timerInterval) clearInterval(timerInterval);
+
+        atualizarTimer();
+        timerInterval = setInterval(atualizarTimer, 1000);
+    }
+
+    // Adiciona os jogadores sequencialmente, aguardando o formulário processar cada inclusão.
+    // A lista oficial #players_string é usada para confirmar cada resultado.
+    const PAUSA_ENTRE_JOGADORES = 3000;
+    const TEMPO_MAXIMO_CONFIRMACAO = 5000;
+
+    function aguardar(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function normalizarNome(valor) {
+        return String(valor || '').trim().toLocaleLowerCase();
+    }
+
+    async function aguardarNomeNaLista(nome, lista, nomesAntes) {
+        const inicio = Date.now();
+        const nomeNormalizado = normalizarNome(nome);
+
+        while (Date.now() - inicio < TEMPO_MAXIMO_CONFIRMACAO) {
+            const textoAtual = lista.textContent || '';
+            const nomesAtuais = textoAtual.split(/[\n,;|]+/).map(normalizarNome).filter(Boolean);
+
+            // Confirma uma mudança na lista e a presença do nome solicitado.
+            if (nomesAtuais.some(item => item === nomeNormalizado) ||
+                (normalizarNome(textoAtual).includes(nomeNormalizado) &&
+                 normalizarNome(textoAtual) !== normalizarNome(nomesAntes))) {
+                return true;
+            }
+
+            await aguardar(250);
+        }
+
+        return false;
+    }
+
+    async function adicionarJogadoresAoFormulario(formulario) {
+        const selecao = obterSelecaoParaSuporte();
+        if (!selecao.valido) {
+            definirStatus(`Seleção inválida: são necessários exatamente ${selecao.limite} jogador(es).`);
+            return false;
+        }
+
+        const campoNome = formulario.querySelector('#player_name');
+        const botaoAdicionar = campoNome?.closest('.input-group')?.querySelector('button.add')
+            || formulario.querySelector('button.add');
+
+        if (!campoNome || !botaoAdicionar) {
+            definirStatus('Título e mensagem foram localizados, mas não encontrei o campo #player_name e o botão Adicionar do formulário.');
+            return false;
+        }
+
+        const listaJogadores = formulario.querySelector('#players_string') || document.querySelector('#players_string');
+        if (!listaJogadores) {
+            definirStatus('Não encontrei #players_string para confirmar as inclusões. Nenhum jogador foi adicionado automaticamente.');
+            return false;
+        }
+
+        definirStatus(`Adicionando nomes... (0/${selecao.nomes.length})`, false);
+
+        for (let i = 0; i < selecao.nomes.length; i++) {
+            const nome = selecao.nomes[i];
+            const nomesAntes = listaJogadores.textContent || '';
+
+            // Não clica novamente se o nome já estiver registrado no formulário.
+            if (normalizarNome(nomesAntes).includes(normalizarNome(nome))) {
+                definirStatus(`Adicionando nomes... (${i + 1}/${selecao.nomes.length}) — ${nome} já estava na lista.`, true);
+                continue;
+            }
+
+            definirStatus(`Adicionando nomes... (${i + 1}/${selecao.nomes.length}) — ${nome}`, false);
+            campoNome.value = nome;
+            campoNome.dispatchEvent(new Event('input', { bubbles: true }));
+            campoNome.dispatchEvent(new Event('change', { bubbles: true }));
+            botaoAdicionar.click();
+
+            const confirmado = await aguardarNomeNaLista(nome, listaJogadores, nomesAntes);
+            if (!confirmado) {
+                definirStatus(`A inclusão de "${nome}" não foi confirmada em até ${TEMPO_MAXIMO_CONFIRMACAO / 1000} segundos. O processo foi interrompido para evitar continuar com falhas.`);
+                return false;
+            }
+
+            incrementarContagemReportes(nome);
+            definirStatus(`Adicionando nomes... (${i + 1}/${selecao.nomes.length}) — ${nome} adicionado.`, true);
+
+            // Dá ao site uma margem adicional antes da próxima interação.
+            if (i < selecao.nomes.length - 1) {
+                await aguardar(PAUSA_ENTRE_JOGADORES);
+            }
+        }
+
+        // Coloca em espera por 6 horas apenas após confirmar o lote inteiro.
+        const esperas = lerJogadoresEmEspera();
+        const fimEsperaJogadores = Date.now() + DURACAO_ESPERA_JOGADOR;
+        for (const nome of selecao.nomes) {
+            esperas[nome.toLocaleLowerCase()] = fimEsperaJogadores;
+        }
+        GM_setValue(CHAVE_ESPERA_JOGADORES, esperas);
+        marcarJogadoresComoReportados(selecao.nomes);
+        GM_setValue(CHAVE_SELECAO_SUPORTE, []);
+        atualizarResumoJogadoresSelecionados();
+        return true;
+    }
+
+    // Preenchimento do formulário oficial.
+    async function preencherCamposSemEventos() {
+        const formulario = document.querySelector('#submit_form');
+        const titulo = formulario?.querySelector('input[name="subject"]');
+        const mensagem = formulario?.querySelector('textarea#message');
+
+        if (!formulario || !titulo || !mensagem) {
+            definirStatus('Não foi possível encontrar título ou mensagem.');
+            return false;
+        }
+
+        titulo.value = tituloInput.value;
+        mensagem.value = mensagemInput.value;
+        const quantidadeSelecionada = obterSelecaoParaSuporte().nomes.length;
+
+        const jogadoresAdicionados = await adicionarJogadoresAoFormulario(formulario);
+        const sucesso =
+            titulo.value === tituloInput.value &&
+            mensagem.value === mensagemInput.value &&
+            jogadoresAdicionados;
+
+        definirStatus(
+            sucesso
+                ? `Título e mensagem preenchidos; lote de até ${quantidadeSelecionada} jogador(es) processado. O temporizador de 5 minutos foi iniciado.`
+                : 'Não foi possível confirmar o preenchimento de todos os campos ou a adição dos jogadores.',
+            sucesso
+        );
+
+        if (sucesso) iniciarTimer();
+        return sucesso;
+    }
+
+    function obterCategoriaRegras() {
+        const categoria = document.querySelector(
+            '#submit_form select[name="typeID"]'
+        );
+
+        if (!categoria) return null;
+
+        const opcao = [...categoria.options].find(option =>
+            /quebra de regras/i.test(option.textContent.trim())
+        );
+
+        return opcao ? { campo: categoria, opcao } : null;
+    }
+
+    async function preencher() {
+        const resultado = obterCategoriaRegras();
+
+        if (!resultado) {
+            definirStatus(
+                'Campo de categoria ou opção "Quebra de Regras" não encontrado.'
+            );
+            return;
+        }
+
+        const { campo, opcao } = resultado;
+
+        if (campo.value !== opcao.value) {
+            definirStatus(
+                'A categoria ainda não está selecionada. Aguarde a atualização da página e tente novamente.'
+            );
+
+            campo.value = opcao.value;
+
+            campo.dispatchEvent(
+                new Event('change', { bubbles: true })
+            );
+
+            return;
+        }
+
+        await preencherCamposSemEventos();
+    }
+
+    botaoPreencher.addEventListener('click', async event => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (botaoPreencher.disabled) return;
+        const fimEspera = Number(sessionStorage.getItem(CHAVE_TIMER) || 0);
+        if (fimEspera > Date.now()) {
+            definirStatus('O assistente está em espera após o lote anterior. Aguarde o fim dos 5 minutos para adicionar outro lote ou preparar outra denúncia.');
+            atualizarTimer();
+            return;
+        }
+        botaoPreencher.disabled = true;
+        const textoOriginalBotao = botaoPreencher.textContent;
+        botaoPreencher.textContent = 'Adicionando nomes...';
+        definirStatus('Adicionando nomes... preparando o formulário.', false);
+        try {
+            await preencher();
+        } catch (erro) {
+            console.error('[Koyo] Falha ao preencher jogadores:', erro);
+            definirStatus('O preenchimento foi interrompido por um erro. Confira a lista de jogadores antes de tentar novamente.');
+        } finally {
+            botaoPreencher.disabled = false;
+            botaoPreencher.textContent = textoOriginalBotao;
+        }
+    }, true);
+
+    botaoSom.addEventListener('click', tocarAlerta);
+
+    // O temporizador do assistente começa após a inclusão bem-sucedida do lote,
+    // independentemente do botão oficial de envio do site.
+
+    // Seleciona "Quebra de Regras" durante a inicialização.
+    // A chave de sessão evita repetir a tentativa indefinidamente
+    // se a página atualizar sem preservar a seleção.
+    function inicializarCategoria() {
+        const resultado = obterCategoriaRegras();
+
+        if (!resultado) return;
+
+        const { campo, opcao } = resultado;
+        const tentativaAnterior =
+            sessionStorage.getItem(CHAVE_CATEGORIA_INICIAL) === '1';
+
+        if (campo.value === opcao.value) {
+            sessionStorage.removeItem(CHAVE_CATEGORIA_INICIAL);
+            return;
+        }
+
+        if (tentativaAnterior) {
+            sessionStorage.removeItem(CHAVE_CATEGORIA_INICIAL);
+            return;
+        }
+
+        sessionStorage.setItem(CHAVE_CATEGORIA_INICIAL, '1');
+
+        campo.value = opcao.value;
+
+        campo.dispatchEvent(
+            new Event('change', { bubbles: true })
+        );
+    }
+
+    sincronizarReportadosComCooldown();
+    atualizarResumoJogadoresSelecionados();
+    inicializarCategoria();
+
+    // Restaura o temporizador se a página for recarregada.
+    if (sessionStorage.getItem(CHAVE_TIMER)) {
+        atualizarTimer();
+
+        if (sessionStorage.getItem(CHAVE_TIMER)) {
+            timerInterval = setInterval(atualizarTimer, 1000);
+        }
+    }
+})();
